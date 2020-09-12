@@ -1,0 +1,320 @@
+import numpy as np
+from PIL import Image
+import os
+import time
+import cv2
+
+def integralImage(img): #Transform each np-array-like image into a integral image for efficient computing
+    s=np.zeros(img.shape)
+    ii=np.zeros(img.shape)
+    for y in range(img.shape[0]):
+        for x in range(img.shape[1]):
+            if y==0:
+                s[y,x]=img[y,x]
+            else:
+                s[y,x]=img[y,x]+s[y-1,x]
+            if x==0:
+                ii[y,x]=s[y,x]
+            else:
+                ii[y,x]=s[y,x]+ii[y,x-1]
+    return ii
+
+def regionSum(ii,topLeft,bottomRight): #Computing the region sum given the integral image,bottom right position and top left position of the target region
+    x1=int(topLeft[0])-1
+    y1=int(topLeft[1])-1
+    x2=int(bottomRight[0])
+    y2=int(bottomRight[1])
+    if not (topLeft[0]==0 or topLeft[1]==0):     
+        return ii[y2,x2]+ii[y1,x1]-ii[y1,x2]-ii[y2,x1]
+    else:
+        if topLeft[0]==0 and topLeft[1]==0:
+            return ii[y2,x2]
+        elif topLeft[0]==0:
+            return ii[y2,x2]-ii[y1,x2]
+        elif topLeft[1]==0:
+            return ii[y2,x2]-ii[y2,x1]
+        
+
+class haarFeature(): #each instance of the haarFeature is a haar feature that has its own attributes and can execute its own operations.
+    def __init__(self,featureType,topLeft,width,height):
+        self.featureType=featureType
+        self.topLeft=topLeft
+        self.width=width
+        self.height=height
+        
+    def getProperty(self):
+        return (self.featureType,self.topLeft,self.width,self.height)
+    
+    def getScore(self,img): #compute the score of the haar feature
+        featureType=self.featureType
+        topLeft=self.topLeft
+        width=self.width
+        height=self.height
+        score=0
+        bottomRight=(topLeft[0]+width-1,topLeft[1]+height-1)
+        if featureType=="twoVerticle":
+            area1=regionSum(img,topLeft,(topLeft[0]+width-1,topLeft[1]+height/2-1))
+            area2=regionSum(img,(topLeft[0],topLeft[1]+height/2),bottomRight)
+            score=area1-area2
+        elif featureType=="twoHorizontal":
+            area1=regionSum(img,topLeft,(topLeft[0]+width/2-1,topLeft[1]+height-1))
+            area2=regionSum(img,(topLeft[0]+width/2,topLeft[1]),bottomRight)
+            score=area1-area2
+        elif featureType=="threeHorizontal":
+            area1=regionSum(img,topLeft,(topLeft[0]+width/3-1,topLeft[1]+height-1))
+            area2=regionSum(img,(topLeft[0]+width/3,topLeft[1]),(topLeft[0]+2*width/3-1,topLeft[1]+height-1))
+            area3=regionSum(img,(topLeft[0]+2*width/3,topLeft[1]),bottomRight)
+            score=area1+area3-area2
+        elif featureType=="threeVerticle":
+            area1=regionSum(img,topLeft,(topLeft[0]+width-1,topLeft[1]+height/3-1))
+            area2=regionSum(img,(topLeft[0],topLeft[1]+height/3),(topLeft[0]+width-1,topLeft[1]+2*height/3-1))
+            area3=regionSum(img,(topLeft[0],topLeft[1]+2*height/3),bottomRight)
+            score=area1+area3-area2
+        elif featureType=="four":
+            area1=regionSum(img,topLeft,(topLeft[0]+width/2-1,topLeft[1]+height/2-1))
+            area2=regionSum(img,(topLeft[0]+width/2,topLeft[1]),(topLeft[0]+width-1,topLeft[1]+height/2-1))
+            area3=regionSum(img,(topLeft[0],topLeft[1]+height/2),(topLeft[0]+width/2-1,topLeft[1]+height-1))
+            area4=regionSum(img,(topLeft[0]+width/2,topLeft[1]+height/2),bottomRight)
+            score=area1+area4-area2-area3
+        return score
+        
+def extractFeature(imgWidth,imgHeight,maxWidth,maxHeight): #generating all haar features that has the max width and max height, given the width and height of the image
+    features=[]
+    nums=[]
+    featureTypes=[("twoVerticle",(1,2)),("twoHorizontal",(2,1)),
+                  ("threeHorizontal",(3,1)),("threeVerticle",(1,3)),("four",(2,2))]
+    for type,size in featureTypes:
+        num=0
+        for width in range(size[0],maxWidth+1,size[0]):
+            for height in range(size[1],maxHeight+1,size[1]):
+                for x in range(imgWidth-width+1):
+                    for y in range(imgHeight-height+1):
+                        features.append(haarFeature(type,(x,y),width,height))
+                        num+=1
+        nums.append(num)
+    print('The total number of haar features is {}, there are {} type 1 features, {} type 2 features, {} type 3 features, {} type 4 features, {} type 5 features'.format(len(features),nums[0],nums[1],nums[2],nums[3],nums[4]))
+    return features
+
+def classifier(feature,img,threshold,polarity): #determine the label of one feature of the target image, given the threshold and polarity information
+    score=feature.getScore(img)
+    if polarity*score<polarity*threshold:
+        return 1
+    else:
+        return 0
+
+def findPara(imgs,w,feature,posW,negW,theta,numPos,numNeg,values): #given a weight distribution, one feature, and the target image, find the parameters of the optimal classifier
+    candidates=[]
+    num=len(imgs)
+    for i in range(num):
+        candidates.append((values[i],w[i],i))
+    bestError=1
+    candidates.sort(key=lambda x: x[0])
+    pos=0
+    neg=0
+    for candidate,weight,i in candidates:
+        if imgs[i][1]==1:
+            pos+=w[i]
+        else:
+            neg+=w[i]
+        if theta*neg+(1-theta)*(posW-pos)<bestError and theta*neg+(1-theta)*(posW-pos)>0:
+            polarity=1
+            threshold=candidate
+            bestError=theta*neg+(1-theta)*(posW-pos)
+            FP=neg
+            FN=posW-pos
+        if (1-theta)*pos+theta*(negW-neg)<bestError and (1-theta)*pos+theta*(negW-neg)<bestError>0:
+            polarity=-1
+            threshold=candidate
+            bestError=(1-theta)*pos+theta*(negW-neg)
+            FP=negW-neg
+            FN=pos
+    return (threshold,polarity,bestError,FP,FN)
+
+def isWrong(vote,label,criteria): #determine whether the vote by the classifier is wrong given the ground-truth label and the criteria
+    if criteria=='empirical error':
+        if vote!=label:
+            return 1
+        else:
+            return 0
+    elif criteria=='false positive':
+        if vote==1 and label==0:
+            return 1
+        else:
+            return 0
+    elif criteria=='false negative':
+        if vote==0 and label==1:
+            return 1
+        else:
+            return 0
+
+def learn(positiveImg1,negativeImg1,positiveImg2,negativeImg2,features,values,boostRound,criteria,start,theta): #train a classifier given train dataset, validation dataset and number of rounds.
+    totalAccuracys=[]
+    totalAccuracys2=[]
+    totalAccuracys3=[]
+    numFeature=len(features)
+    numPos=len(positiveImg1)
+    numNeg=len(negativeImg1)
+    num=numPos+numNeg
+    imgs=positiveImg1+negativeImg1
+    w=[0]*num
+    bestFeatures=[]
+    alpha=[]
+    for i in range(num):
+        if imgs[i][1]==1:
+            w[i]=1/(2*numPos)
+        else:
+            w[i]=1/(2*numNeg)
+    paras=[]
+    for t in range(boostRound):
+        posW=0
+        negW=0
+        for i in range(len(w)):
+            w[i]/=sum(w)
+        for i in range(len(w)):
+            if imgs[i][1]==1:
+                posW+=w[i]
+            else:
+                negW+=w[i]
+        bestError=1
+        index=0
+        for feature in features:
+            threshold,polarity,error,FP,FN=findPara(imgs,w,feature,posW,negW,theta,numPos,numNeg,values[index])
+            index+=1
+            if error<=bestError:
+                bestError=error
+                bestFeature=feature
+                para=(threshold,polarity)
+        paras.append(para)
+        bestFeatures.append(bestFeature)
+        beta=bestError/(1-bestError)
+        alpha.append(np.log(1/beta))
+        threshold,polarity=para
+        FP=0
+        FN=0
+        for i in range(len(w)):
+            vote=classifier(bestFeature,imgs[i][0],threshold,polarity)
+            label=imgs[i][1]
+            if isWrong(vote,label,criteria):
+                w[i]*=1
+                if isWrong(vote,label,'false positive'):
+                    FP+=1/(numNeg*2)
+                else:
+                    FN+=1/(numPos*2)
+            else:
+                w[i]*=beta
+        print('For adaboost round {}:'.format(t+1))
+        featureType,position,width,height=bestFeatures[t].getProperty()
+        print('feature {}: type is {}, position is {}, width is {}, height is {},threshold is {:.3f}, polarity is {}, alpha is {:.3f}.'.format(t+1,featureType,position,width,height,paras[t][0],paras[t][1],alpha[t]))
+        print('accracy of the classifier is {:.3f}, false positive rate is {:.3f}, false negative rate is {:.3f}.'.format(1-FP-FN,FP,FN))
+        totalAccuracys3.append(round(1-FP-FN,3))
+        print('For training set,')
+        totalAccuracy=test(positiveImg1,negativeImg1,alpha,bestFeatures,paras)
+        totalAccuracys2.append(totalAccuracy)
+        print('For testing set,')
+        totalAccuracy=test(positiveImg2,negativeImg2,alpha,bestFeatures,paras)
+        totalAccuracys.append(totalAccuracy)
+        end = time.time()
+        print('time spent: {:.1f} s'.format(end-start))
+    print('The accuracy for each classifier is {}'.format(totalAccuracys3))
+    print('The total training accuracy for each round is {}'.format(totalAccuracys2))
+    print('The total testing accuracy for each round is {}'.format(totalAccuracys))
+    return (bestFeatures,paras,alpha)
+
+def test(positiveImg,negativeImg,alpha,bestFeatures,paras): #test the final classifier on the test dataset, and output the results
+    posNum=len(positiveImg)
+    negNum=len(negativeImg)
+    imgs=positiveImg+negativeImg
+    FP=0
+    FN=0
+    for img,label in imgs:
+        s=0
+        for i in range(len(bestFeatures)):
+            threshold,polarity=paras[i]
+            score=bestFeatures[i].getScore(img)
+            s+=alpha[i]*classifier(bestFeatures[i],img,threshold,polarity)
+        if s>=sum(alpha)/2:
+            vote=1
+        else:
+            vote=0
+        if vote==1 and label==0:
+            FP+=1/(2*negNum)
+        if vote==0 and label==1:
+            FN+=1/(2*posNum)
+    print('Total accuracy is {:.3f}, false positive rate is {:.3f}, false negative rate is {:.3f}'.format(1-FP-FN,FP,FN))
+    return round(1-FP-FN,3)
+
+def readImg(directory):
+    imgs=[]
+    for filename in os.listdir(directory):
+        img = np.asarray(Image.open(directory + "/" + filename))
+        imgs.append(img)
+    return imgs
+
+def draw(featureType,topLeft,width,height,demo):
+    bottomRight=(topLeft[0]+width,topLeft[1]+height)
+    cv2.rectangle(demo,topLeft,bottomRight,(255,0,0))
+    if featureType=='twoVerticle':
+        cv2.line(demo,(topLeft[0],int(topLeft[1]+height/2)),(topLeft[0]+width,int(topLeft[1]+height/2)),(255,0,0))
+    elif featureType=='twoHorizontal':
+        cv2.line(demo,(int(topLeft[0]+width/2),topLeft[1]),(int(topLeft[0]+width/2),topLeft[1]+height),(255,0,0))
+    elif featureType=='threeHorizontal':
+        cv2.line(demo,(int(topLeft[0]+width/3),topLeft[1]),(int(topLeft[0]+width/3),topLeft[1]+height),(255,0,0))
+        cv2.line(demo,(int(topLeft[0]+2*width/3),topLeft[1]),(int(topLeft[0]+2*width/3),topLeft[1]+height),(255,0,0))
+    elif featureType=='threeVerticle':
+        cv2.line(demo,(topLeft[0],int(topLeft[1]+height/3)),(topLeft[0]+width,int(topLeft[1]+height/3)),(255,0,0))
+        cv2.line(demo,(topLeft[0],int(topLeft[1]+2*height/3)),(topLeft[0]+width,int(topLeft[1]+2*height/3)),(255,0,0))
+    elif featureType=="four":
+        cv2.line(demo,(topLeft[0],int(topLeft[1]+height/2)),(topLeft[0]+width,int(topLeft[1]+height/2)),(255,0,0))
+        cv2.line(demo,(int(topLeft[0]+width/2),topLeft[1]),(int(topLeft[0]+width/2),topLeft[1]+height),(255,0,0))
+    demo=cv2.resize(demo,(200,200))
+    cv2.imshow('fig',demo)
+    cv2.waitKey()
+    cv2.destroyAllWindows()
+    
+
+start = time.time()
+positiveImg1=readImg(r'dataset\trainset\faces')
+negativeImg1=readImg(r'dataset\trainset\non-faces')
+positiveImg2=readImg(r'dataset\testset\faces')
+negativeImg2=readImg(r'dataset\testset\non-faces')
+demo=[]
+roundNum=5
+for i in range(roundNum):
+    img=cv2.imread(r'dataset\testset\faces\cmu_0002.png')
+    demo.append(img)
+#read in datasets and store as lists of tuples of image array and label pair
+for i in range(len(positiveImg1)):
+    positiveImg1[i]=(integralImage(positiveImg1[i]),1)
+for i in range(len(negativeImg1)):
+    negativeImg1[i]=(integralImage(negativeImg1[i]),0)
+for i in range(len(positiveImg2)):
+    positiveImg2[i]=(integralImage(positiveImg2[i]),1)
+for i in range(len(negativeImg2)):
+    negativeImg2[i]=(integralImage(negativeImg2[i]),0)
+criteria=['empirical error','false positive','false negative']
+size=positiveImg1[0][0].shape
+features=extractFeature(size[0],size[1],8,8)
+'''
+#compute the scores of each feature of each image and store them in a list
+values=[]
+for feature in features:
+    value=[]
+    for img,label in imgs:
+        value.append(feature.getScore(img))
+    values.append(value)
+end = time.time()
+print('Preparation spent time: {:.1f} s'.format(end-start))
+np.save("data.npy",values)
+'''
+values=np.load("data.npy")
+end = time.time()
+print('Preparation spent time: {:.1f} s'.format(end-start))
+bestFeatures,paras,alpha=learn(positiveImg1,negativeImg1,positiveImg2,negativeImg2,features,values,roundNum,criteria[0],start,0.9)
+i=0
+for feature in bestFeatures:
+    featureType,topLeft,width,height=feature.getProperty()
+    draw(featureType,topLeft,width,height,demo[i])
+    i+=1
+for i in range(roundNum):
+    cv2.imwrite('{}.jpg'.format(i),demo[i])
+
